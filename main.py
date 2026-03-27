@@ -1,4 +1,3 @@
-toma ai garrafa mijada
 
 import os
 import sys
