@@ -150,7 +150,7 @@ def monitor_new_hosts(lan_info, interval=10):
 
 
 # NOVA THREAD: Avalia ciclicamente a eficiência do ataque contra os alvos
-def health_check_spoofing(lan_info, interval=10):
+def health_check_spoofing(lan_info, interval=8):
     print(f"[*] Verificador de integridade do Spoofing ativo (Intervalo: {interval}s)...")
     while True:
         time.sleep(interval)
