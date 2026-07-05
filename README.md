@@ -39,19 +39,35 @@ Gateway <──── ARP falso (vítima = MAC atacante)  ────>  Atacant
 
 **Sistema operacional:** Linux (requer permissão root)
 
-**Dependências:**
+**Dependências do sistema:**
 
 ```bash
-pip install scapy psutil netifaces
 apt install dsniff  # fornece o comando arpspoof
 ```
 
+**Dependências Python:** (instaladas via `requirements.txt` na venv)
+
 ---
 
-## 🚀 Uso
+## 🚀 Instalação e Uso
+
+### 1️⃣ Criar e ativar a venv
 
 ```bash
-sudo python3 main.py [OPÇÕES]
+python3 -m venv venv
+source venv/bin/activate
+```
+
+### 2️⃣ Instalar dependências
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3️⃣ Executar a ferramenta
+
+```bash
+sudo venv/bin/python3 main.py [OPÇÕES]
 ```
 
 ### Opções
@@ -61,14 +77,19 @@ sudo python3 main.py [OPÇÕES]
 | `--no-forward`    | Desabilita IP Forwarding — **modo DoS** (padrão recomendado) |
 | `--forward`       | Habilita IP Forwarding — **modo MitM** (interceptação)      |
 
-### Exemplos
+### Exemplos Completos
 
 ```bash
+# Setup inicial
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
 # Ataque DoS contra todos os hosts da LAN
-sudo python3 main.py --no-forward
+sudo venv/bin/python3 main.py --no-forward
 
 # Interceptação (MitM) de tráfego
-sudo python3 main.py --forward
+sudo venv/bin/python3 main.py --forward
 ```
 
 ---
