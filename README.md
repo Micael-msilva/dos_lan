@@ -60,7 +60,6 @@ sudo python3 main.py [OPÇÕES]
 |-------------------|-------------------------------------------------------------|
 | `--no-forward`    | Desabilita IP Forwarding — **modo DoS** (padrão recomendado) |
 | `--forward`       | Habilita IP Forwarding — **modo MitM** (interceptação)      |
-| `--spoof-gateway` | Inclui o próprio gateway na lista de alvos                  |
 
 ### Exemplos
 
@@ -70,9 +69,6 @@ sudo python3 main.py --no-forward
 
 # Interceptação (MitM) de tráfego
 sudo python3 main.py --forward
-
-# Incluir o gateway como alvo também
-sudo python3 main.py --no-forward --spoof-gateway
 ```
 
 ---
